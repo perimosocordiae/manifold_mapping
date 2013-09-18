@@ -1,0 +1,16 @@
+<launch>
+	<!-- <node pkg="stage" name="stage" type="stageros" args="/home/br7/Ros-Spring-2010/manifold_mapping/data/simulator.world" /> -->
+	<!-- <node pkg="stage" name="stage" type="stageros" args="/home/cec/s/c/cmc4/robots/cse553/manifold_mapping/data/simulator.world" /> -->
+    <param name="lin_axis" value="1"/>
+    <param name="ang_axis" value="0"/>
+    <param name="deadman"  value="0"/>
+    <node name="joy_node" pkg="joy" type="joy_node"/>
+<!--    <node name="teleop_joy" pkg="teleop_joy" type="teleop_joy.py"/> -->
+
+	<node name="server" pkg="manifold_mapping" type="server" output="screen"/>
+
+	<node name="robot" pkg="manifold_mapping" type="robot" args="tears" output="screen" />
+
+	<node name="projector" pkg="manifold_mapping" type="projector" />
+	<node name="joystick_landmarker" pkg="manifold_mapping" type="joystick_landmarker" args="tears" output="screen" />
+</launch>

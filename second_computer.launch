@@ -1,0 +1,5 @@
+<launch>
+	<node pkg="joy" name="joy_node_1" type="joy_node" args="/joy:=joy1" />
+	<node name="teleop_joy_1" pkg ="teleop_joy" type ="teleop_joy.py" args="/joy:=/joy1 /cmd_vel:=/robot_1/cmd_vel" />
+
+</launch>

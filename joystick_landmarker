@@ -1,0 +1,32 @@
+#!/usr/bin/env python
+
+PKG = 'manifold_mapping'
+import roslib
+roslib.load_manifest(PKG)
+import rospy
+from sys import argv,exit
+from std_msgs.msg import String
+from joy.msg import Joy
+
+
+class Landmarker(object):
+    def __init__(self,rname):
+        rospy.init_node('joystick_landmarker_%s' % rname)
+        self.landmark_pub = rospy.Publisher('/landmark_%s' % rname, String)
+        self.rname = rname
+        rospy.Subscriber('/joy',Joy,self.callback)
+
+    def callback(self,joy_msg):
+        if joy_msg.buttons[1] == 1:  # button 2 pressed
+            self.landmark_pub.publish(self.rname)
+        elif joy_msg.buttons[2] == 1:  # button 3 pressed
+            othername = 'tears' if self.rname == 'toil' else 'toil'  # dirty hack
+            self.landmark_pub.publish(othername)
+        elif joy_msg.buttons[3] == 1:  # button 4 pressed
+            print "button 4 pressed: do self-loop closure here"
+
+if __name__ == '__main__':
+    if len(argv) < 2:
+        exit("Usage: %s robot_name" % argv[0])
+    l = Landmarker(argv[1])
+    rospy.spin()

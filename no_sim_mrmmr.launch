@@ -1,0 +1,8 @@
+<launch>
+
+
+	<node name="server" pkg="manifold_mapping" type="server" output="screen"/>
+
+	<node name="robot" pkg="manifold_mapping" type="robot" args="tears" output="screen" />
+	<node name="projector" pkg="manifold_mapping" type="projector" />
+</launch>

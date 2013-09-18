@@ -1,0 +1,352 @@
+#!/usr/bin/env python
+
+PKG = 'manifold_mapping'
+import roslib
+roslib.load_manifest(PKG)
+import rospy
+from itertools import izip
+from numpy import zeros,array,uint8,int8,int,dot,eye,cos,sin,abs
+from math import pi,atan2,hypot
+from PIL import Image
+from nav_msgs.msg import OccupancyGrid
+from manifold_mapping.msg import PatchList,Patch,Relation
+
+# curse you, ROS, and your absolutism!
+DATA_PATH = '/home/robotics/reiterb/robots/manifold_mapping/data/'
+
+
+class Server(object):
+    def __init__(self):
+        rospy.init_node('manifold_mapping_server')
+        self.planar_map = PatchList()  # placeholder
+        self.queue = {}  # hash robot_id => (patches,relations)
+        rospy.Subscriber('/align_patches',PatchList,self.align)
+        self.temp_i = 0
+        self.pub = rospy.Publisher('/merged',PatchList)
+        #rospy.Service('map_server',OccupancyGrid,self.serve_map)
+
+    def align(self,pl_msg):
+        self.temp_i+=1
+        patches,relations = pl_msg.patches, pl_msg.relations
+
+        sender,observer = pl_msg.sender_id.split()[-1],pl_msg.observed_id.split()[-1]
+        print "server: got patches from",sender
+
+        if sender != observer:
+            if sender not in self.queue:  # wait for the other data
+                self.queue[observer] = (patches,relations)
+                self.temp_i-=1
+                print "server: waiting for data from %s" % observer
+                return
+            else:  # got the data we were waiting for
+                ps2,rels2 = self.queue[sender]
+                patches,relations,glue_i = self.merge(pl_msg.observed_id,pl_msg.sender_id,patches,relations,ps2,rels2)
+                self.queue.clear()
+
+        self.planar_map = PatchList(patches=patches,relations=relations)
+        grid = self.serve_map()
+        grid2img(grid, "%d_prefit" % self.temp_i)
+
+        # perform the fitting step
+        patches,relations = self.fit(patches,relations)
+
+        #self.planar_map = PatchList(patches=patches,relations=relations)
+        #grid = self.serve_map()
+        #grid2img(grid, "%d_postfit"%self.temp_i)
+
+        # publish the results
+        print "server: publishing patches"
+        if sender == observer:
+            self.__publish_patches(sender,  patches,relations)
+        else:
+            pts = [p.points for p in sorted(patches,key=lambda p:p.uid)]
+            relations.append(self.retrace_steps(glue_i,relations))
+            #print relations[-1]
+            patches.append(Patch(uid=relations[-1].p2_uid,points=None))
+            patches[-1].points = pts[glue_i]
+            self.__publish_patches(observer,patches,relations)
+
+            #self.planar_map = PatchList(patches=patches,relations=relations)
+            #grid = self.serve_map()
+            #grid2img(grid, "%d_plus0"%self.temp_i)
+
+            relations[-1] = self.retrace_add_glue(glue_i,relations)
+            #print relations[-1]
+            patches[-1].points = pts[glue_i-1]
+            self.__publish_patches(sender,  patches,relations)
+
+            #self.planar_map = PatchList(patches=patches,relations=relations)
+            #grid = self.serve_map()
+            #grid2img(grid, "%d_plus1"%self.temp_i)
+
+        self.planar_map = PatchList(patches=patches,relations=relations)
+        grid = self.serve_map()
+        grid2img(grid, self.temp_i)
+
+    def merge(self,rname1,rname2,ps1,rels1,ps2,rels2):
+        '''ps1 and rels1 are the patches and relations from the first robot that sent in.'''
+        print "server: merging %s to %s" % (rname1,rname2)
+        patches1 = dict((p.uid,p.points) for p in ps1)
+        patches2 = dict((p.uid,p.points) for p in ps2)
+        relates1 = dict((r.p2_uid,(r.d,r.dThetaMove,r.dThetaPose)) for r in rels1)
+        relates2 = dict((r.p2_uid,(r.d,r.dThetaMove,r.dThetaPose)) for r in rels2)
+
+        #self.planar_map = PatchList(patches=ps1,relations=rels1)
+        #grid = self.serve_map()
+        #grid2img(grid, "%d_unmerged_1"%self.temp_i)
+
+        #self.planar_map = PatchList(patches=ps2,relations=rels2)
+        #grid = self.serve_map()
+        #grid2img(grid, "%d_unmerged_2"%self.temp_i)
+
+        merged_rels = []
+        merged_patches = []
+        timestamp = ''  # patches1.iterkeys().next()
+
+        for id in sorted(patches1.iterkeys()):
+            merged_rels.append(relates1[id])
+            merged_patches.append(patches1[id])
+        glue_i = len(merged_rels)
+        merged_rels.append((-2,0,pi))  # the 'glue' relation
+        for id in reversed(sorted(patches2.iterkeys())):
+            merged_patches.append(patches2[id])
+            r = relates2[id]
+            merged_rels.append((-r[0],-r[1],-r[2]))
+
+        merged_rel_msg = [Relation(p2_uid='%s.%04d' % (timestamp,i),d=r[0],dThetaMove=r[1],dThetaPose=r[2]) for i,r in enumerate(merged_rels)]
+        merged_pat_msg = [Patch(uid='%s.%04d' % (timestamp,i),points=ps) for i,ps in enumerate(merged_patches)]
+
+        #self.planar_map = PatchList(patches=merged_pat_msg[:glue_i],relations=merged_rel_msg[:glue_i])
+        #grid = self.serve_map()
+        #grid2img(grid, "%d_merged1"%self.temp_i)
+
+        #self.planar_map = PatchList(patches=merged_pat_msg[glue_i:],relations=merged_rel_msg[glue_i:])
+        #grid = self.serve_map()
+        #grid2img(grid, "%d_merged2"%self.temp_i)
+
+        return merged_pat_msg,merged_rel_msg,glue_i
+
+    def retrace_steps(self,glue_i,relations_msg):
+        back_rel = zeros(3)
+        relates = (array([r.d,r.dThetaMove,r.dThetaPose]) for r in reversed(list(sorted(relations_msg,key=lambda r:r.p2_uid))[glue_i+1:-1]))
+        for r in relates:
+            back_rel -= r
+        uid = max(r.p2_uid for r in relations_msg)
+        return Relation(p2_uid=uid,d=back_rel[0],dThetaMove=back_rel[1],dThetaPose=back_rel[2])
+
+    def retrace_add_glue(self,glue_i,relations_msg):
+        r = relations_msg[-1]
+        glue = list(sorted(relations_msg,key=lambda r:r.p2_uid))[glue_i]
+        r.d = -r.d + glue.d
+        r.dThetaMove = -r.dThetaMove + glue.dThetaMove
+        r.dThetaPose = -r.dThetaPose + glue.dThetaPose
+        return r
+
+    def fit(self,patch_list_msg,relations_msg):
+        print "server: fitting"
+        patches = dict((p.uid,p.points) for p in patch_list_msg)
+        relates = dict((r.p2_uid,(r.d,r.dThetaMove,r.dThetaPose)) for r in relations_msg)
+        transf = eye(3)
+        sorted_ids = sorted(patches.iterkeys())
+        prev_points = array([(p.x,p.y) for p in patches[sorted_ids[0]].points])
+        for uid in sorted_ids[1:]:
+            d,dm,dp = relates[uid]
+            points = array([(p.x,p.y,1) for p in patches[uid].points]).T
+
+            try_offsets = lambda off: dot(transf,dot(rot(dp+off[2]),transDT(d+off[0],dm+off[1])))
+            #score = lambda t: set_distance(prev_points,dot(t,points)[:2,:].T)
+            score = lambda t,res: grid_score(prev_points,dot(t,points)[:2,:].T,res)
+
+            motions = array([(0.1,0,0),(0,0.5,0),(0,0,0.1),(-0.1,0,0),(0,-0.5,0),(0,0,-0.1)])
+            offsets = zeros(3,dtype=float)
+            scale = 200
+            while True:
+                while True:
+                    t = try_offsets(offsets)
+                    base_score = score(t,scale)
+                    m_scores = array([score(try_offsets(offsets+m),scale) for m in motions])
+                    #print m_scores
+                    if m_scores.min() >= base_score:
+                        break
+                    offsets += motions[m_scores.argmin()]
+                    #print motions[m_scores.argmin()]
+                if motions[0,0] < 0.001:
+                    break  # or try again?
+                else:
+                    motions /= 1.3
+                #scale += 50
+            print "server: offsets =",offsets, "score =",base_score
+            transf = t
+            #pp = dot(t,points)[:2,:].T
+            prev_points = dot(t,points)[:2,:].T
+            #prev_points.resize((prev_points.shape[0]+pp.shape[0],2),refcheck=False)
+            #prev_points[-pp.shape[0]:,:] = pp # concat the new points to the old
+            relates[uid] = (d,dm,dp)+offsets
+        new_rel_msg = [Relation(p2_uid=id,d=r[0],dThetaMove=r[1],dThetaPose=r[2]) for id,r in relates.iteritems()]
+        return patch_list_msg,new_rel_msg
+
+    def serve_map(self):
+        aligned_points = project_points(self.planar_map.patches,self.planar_map.relations)
+        ppp = [len(ps) for ps in aligned_points]
+        cumsums = [ppp[0]]
+        for np in ppp[1:]:
+            cumsums.append(np+cumsums[-1])
+        cumsums.append(0)  # dummy zero for easy indexing
+        mlist = zeros((sum(ppp),2))
+        for i,points in enumerate(aligned_points):
+            mlist[cumsums[i-1]:cumsums[i],:] = points
+        #aligned_points = array(aligned_points).reshape((-1,2))
+        cumsums.pop()  # remove the dummy 0
+        return mk_occ_grid_dirty(mlist,ppp)
+        #return mk_occ_grid(mlist)
+
+    def __publish_patches(self,rname,patches,relations):
+        self.pub.publish(PatchList(sender_id=rname, patches=patches, relations=relations))
+#end class
+
+
+def grid2img(occ_grid,idstr):
+    shape = (occ_grid.info.width,occ_grid.info.height)
+    assert min(shape) > 0
+    print "server: writing image: planarMap%s.png" % idstr
+    mat = (array(occ_grid.data).reshape(shape)).astype(uint8)
+    img = Image.fromarray(mat.T,'L')
+    matte = Image.new('L',(10+img.size[0],10+img.size[1]),'gray')
+    matte.paste(img,(5,5))
+    img.save(DATA_PATH+'planarMap%s.png' % idstr)
+
+
+def dist(p1,p2):
+    return hypot(p2[0]-p1[0],p2[1]-p1[1])
+
+
+def dist2(p1,p2):
+    dx,dy = p2[0]-p1[0],p2[1]-p1[1]
+    return dx*dx+dy*dy
+
+
+def transXY(dx,dy):
+    return array([[1,0,dx],[0,1,dy],[0,0,1]])
+
+
+def transDT(d,theta):
+    return transXY(d*cos(theta),d*sin(theta))
+
+
+def rot(r):
+    return array([[cos(r), -sin(r),0],[sin(r),cos(r),0],[0,0,1]])
+
+
+def xysort(points):
+    return array(sorted(sorted(points,key=lambda e:e[1]),key=lambda e:e[0]))
+
+
+def grid_score(ptsA,ptsB,res):
+    minXY = ptsA.min(0)
+    maxXY = ptsA.max(0)
+    gridA = bound_points(ptsA,minXY,maxXY,res)
+    gridB = bound_points(ptsB,minXY,maxXY,res)
+    shape = gridA.max(0)+3  # +2 for padding
+    occA = zeros(shape)
+    occB = zeros(shape)
+    gauss = array([[0.3,0.6,0.1],[0.6,1,0.6],[0.3,0.6,0.3]])
+    for x,y in gridA:  # shift +1
+        occA[x:x+3,y:y+3] += gauss
+    occA[occA > 1] = 1
+    for x,y in gridB:
+        if 0 <= x < shape[0]-2 and 0 <= y < shape[1]-2:
+            occB[x:x+3,y:y+3] -= gauss
+    occB[occB < -1] = -1
+    occ = occA+occB
+    score = abs(occ).sum()*25000/(shape[0]*shape[1])
+    #    occ = (occ*127+127).astype(uint8)
+    #    Image.fromarray(occ,'L').save(DATA_PATH+'grid_%d.png'%score)
+    return score
+
+
+def set_distance(ptsA,ptsB):
+    broad = ptsA.reshape((-1,1,2))  # add a dimension for broadcasting
+    dists = ((broad-ptsB)**2).sum(2)  # w00t outer product -style distances
+    #b2a,a2b = dists.min(0),dists.min(1)
+    #return a2b.sum()+b2a.sum()
+    b2a = dists.min(1)  # actually a2b
+    return b2a[b2a < 10].sum()  # threshold to exclude new real data
+
+
+def project_points(patch_list_msg,relations_msg):
+    patches = dict((p.uid,p.points) for p in patch_list_msg)
+    relates = dict((r.p2_uid,(r.d,r.dThetaMove,r.dThetaPose)) for r in relations_msg)
+    transf = eye(3)
+    patch_points = []
+    sorted_ids = sorted(patches.iterkeys())
+    for uid in sorted_ids:
+        d,dm,dp = relates[uid]
+        transf = dot(transf,dot(rot(dp),transDT(d,dm)))
+        points = array([(p.x,p.y,1) for p in patches[uid].points]).T
+        points = dot(transf,points)
+        patch_points.append(points[:2,:].T)
+    return patch_points
+
+
+def mk_cvimg(pts):
+    occ_grid = mk_occ_grid(pts)
+    shape = (occ_grid.info.width,occ_grid.info.height)
+    mat = (array(occ_grid.data).reshape(shape)).astype(uint8).T
+    cv_img = cv.CreateImageHeader(shape,cv.IPL_DEPTH_8U,1)
+    cv.SetData(cv_img,mat.tostring(),mat.dtype.itemsize*shape[0])
+    #cv.SaveImage(DATA_PATH+'cvpatchimage.png',cv_img)
+    return cv_img
+
+
+def houghlines(cv_img):
+    lines = cv.HoughLines2(cv_img,cv.CreateMemStorage(0),cv.CV_HOUGH_PROBABILISTIC,1,pi/180,1,5,1)
+    slope = lambda a,b: atan2(b[1]-a[1],b[0]-a[0])
+    midpt = lambda a,b,ang: (cos(ang)/2.0*(a[0]+b[0]),sin(ang)/2.0*(a[1]+b[1]))
+    slopes = [slope(a,b) for a,b in lines]
+    pts = [midpt(l[0],l[1],s) for l,s in izip(lines,slopes)]
+    return pts,slopes
+
+
+def bound_points(mlist,minXY,maxXY,width=300):
+    blist = mlist -array(minXY)  # shift the points to start at 0,0
+    scale = width/float(maxXY[0]-minXY[0])  # scale it to width
+    return (blist*scale).astype(int)  # cast to ints
+
+
+def mk_occ_grid(mlist):
+    og = OccupancyGrid()
+    # get a bounding box on the coordinates
+    mlist = bound_points(mlist,mlist.min(0),mlist.max(0))
+    # set up occ. grid
+    og.info.width,og.info.height = mlist.max(0)+1
+    data = zeros((og.info.width,og.info.height),dtype=int8)
+    for x,y in mlist:
+        data[x,og.info.height-1-y] = 100  # fully occupied (flip y coord)
+    og.data = data.flatten()
+    return og
+
+
+def mk_occ_grid_dirty(mlist,ppp):
+    og = OccupancyGrid()
+    # get a bounding box on the coordinates
+    mlist = bound_points(mlist,mlist.min(0),mlist.max(0))
+    # set up occ. grid
+    og.info.width,og.info.height = mlist.max(0)+1
+    data = zeros((og.info.width,og.info.height),dtype=int8)
+    # here there be dirty hacks
+    incr = 200/(len(ppp)-1)
+    i,pi,val = 0,0,255
+    for x,y in mlist:
+        data[x,og.info.height-1-y] = val  # fully occupied (flip y coord)
+        if i == ppp[pi]:
+            val -= incr
+            pi += 1
+            i = -1
+        i += 1
+    og.data = data.flatten()
+    return og
+
+if __name__ == '__main__':
+    s = Server()
+    print "server: started"
+    rospy.spin()
